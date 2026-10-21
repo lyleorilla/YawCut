@@ -20,7 +20,7 @@ over a checkerboard, saved to `outputs/`.
     onnxruntime==1.16.3 \
     numpy==1.26.4 \
     opencv-python-headless==4.10.0.84 \
-    huggingface_hub pillow requests gradio
+    huggingface_hub 'pillow>=11.3' requests gradio
 
 # 3. First run downloads the model into model_cache/ (needs internet, once)
 ./venv/bin/python app.py --no-browser   # or just: ./venv/bin/python app.py
@@ -39,6 +39,31 @@ over a checkerboard, saved to `outputs/`.
 After the first download you can cut the network entirely — try
 `HF_HUB_OFFLINE=1 ./venv/bin/python app.py` to confirm.
 
+## Input formats
+
+Uploads and clipboard pastes accept **JPG, PNG, BMP, TIFF, WebP and AVIF**,
+including AVIF with alpha, greyscale or 10/12-bit colour. Output is always a
+transparent RGBA PNG at the original resolution.
+
+AVIF is decoded by **Pillow's bundled libavif**, not by macOS:
+
+- AVIF read support needs the libavif built into Pillow's wheels (Pillow ≥ 11.3).
+  `app.py` probes it at startup and logs either
+  `AVIF decoder: libavif 1.4.2 (Pillow 12.3.0)` or a warning telling you to
+  upgrade Pillow; without it, `.avif` uploads fail with that same instruction
+  instead of a confusing decode error.
+- Whatever the source profile, Pillow hands the pipeline 8-bit RGB/RGBA, so
+  preprocessing, inference and compositing are unchanged.
+- Some AVIF files are rejected by the decoder itself (conformance-suite files,
+  some HDR/gain-map encodes). Those surface the decoder's own reason — re-export
+  as PNG/JPEG/WebP — rather than looking like a corrupt upload.
+- There is deliberately **no shell fallback** to `sips` or `ffmpeg`: this machine
+  runs macOS 12 Monterey, where `sips` cannot open AVIF (exit 13) and the local
+  ffmpeg 4.4 cannot even demux AVIF.
+
+A file whose extension is missing or wrong is judged by its contents, so a
+renamed `photo.jpg` that is really a PNG (or a `.avif`) still works.
+
 ## Why these pins
 
 | package | pin | reason |
@@ -46,6 +71,7 @@ After the first download you can cut the network entirely — try
 | `onnxruntime` | `1.16.3` | Newest release that still ships Intel-macOS wheels usable on macOS 12 Monterey. 1.17+ requires newer macOS; 1.22+ has no Intel-Monterey wheel at all. |
 | `numpy` | `1.26.4` | onnxruntime 1.16.3 is built against the NumPy 1.x ABI; NumPy 2.x breaks it at import. Also has cp311 wheels. |
 | `opencv-python-headless` | `4.10.0.84` | Last line with cp311 wheels that builds cleanly on Monterey; headless = no GUI deps. |
+| `pillow` | `>=11.3` | AVIF input depends on the libavif bundled in Pillow's own wheels, which shipped from 11.3; older Pillow decodes no AVIF at all. `app.py` probes it at startup. |
 | Python | `3.11` | onnxruntime 1.16.3 has no cp312 wheels, and Homebrew has no Monterey bottle for 3.11 — hence the portable interpreter. |
 
 ## Why a portable Python 3.11

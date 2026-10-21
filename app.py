@@ -18,11 +18,13 @@ import argparse
 import hashlib
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 import cv2
+import PIL
 from PIL import Image, ImageOps
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -52,7 +54,13 @@ MAX_INPUT_BYTES = 60 * 1024 * 1024   # reject absurd uploads before decoding
 MAX_INPUT_PIXELS = 60_000_000        # 60 MP; RGBA + mask + resize would thrash 16 GB
 PREVIEW_MAX_SIDE = 1200              # display only - the PNG download stays full res
 
-SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
+                 ".avif"}
+# A suffix is only a hint - renamed files exist and clipboard pastes arrive as
+# .webp - so an unknown one is confirmed with Pillow's own format detection
+# rather than rejected sight unseen.
+SNIFFABLE_FORMATS = {"JPEG": ".jpg", "PNG": ".png", "BMP": ".bmp",
+                     "TIFF": ".tif", "WEBP": ".webp", "AVIF": ".avif"}
 
 
 def log(msg: str) -> None:
@@ -435,6 +443,63 @@ class InputError(Exception):
     """Anything the user can fix: wrong file, broken file, absurdly big file."""
 
 
+@lru_cache(maxsize=1)
+def avif_decoder_version() -> Optional[str]:
+    """Return the bundled libavif version if Pillow can decode AVIF, else None.
+
+    Pillow wheels bundle libavif starting with Pillow 11.0 / 11.3; a system without
+    that plugin raises ValueError on check_module('avif') or returns False.
+    """
+    try:
+        from PIL import features
+        if features.check_module("avif"):
+            ver = features.version("avif")
+            return f"libavif {ver}" if ver else "present"
+    except Exception:
+        pass
+    return None
+
+
+def _looks_like_avif(path: Path) -> bool:
+    """True when the file starts with an ISOBMFF 'ftyp' box naming an AVIF brand.
+
+    Distinguishes "libavif could not decode this AVIF" from "this is not an AVIF
+    file at all" (wrong extension, truncated download, saved error page).
+    """
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(64)
+    except OSError:
+        return False
+    return len(head) >= 12 and head[4:8] == b"ftyp" and (
+        b"avif" in head or b"avis" in head)
+
+
+def describe_decode_error(path: Path, exc: Exception) -> str:
+    """Turn an open/load exception into advice the user can act on."""
+    cname = exc.__class__.__name__
+    reason = str(exc).strip().replace("\n", " ")[:120]
+
+    if path.suffix.lower() == ".avif":
+        dec = avif_decoder_version()
+        if not _looks_like_avif(path):
+            return (f"{path.name} has an .avif extension but is not an AVIF file "
+                    f"(no 'ftyp' header). It may be a truncated download or a "
+                    f"different format under the wrong name ({cname}: {reason}).")
+        if not dec:
+            return (f"Cannot read {path.name}: this environment has no AVIF decoder. "
+                    "Run `./venv/bin/pip install -U 'pillow>=11.3'` to enable it "
+                    f"({cname}: {reason}).")
+        return (f"Could not decode {path.name}: {dec} could not parse this AVIF. "
+                "Conformance-suite, HDR and gain-map encodes are often unsupported; "
+                f"re-exporting it as PNG, JPEG or WebP will work ({cname}: {reason}).")
+
+    known = path.suffix.lower() in SUPPORTED_EXT
+    hint = "" if known else f" Supported: {', '.join(sorted(SUPPORTED_EXT))}."
+    return (f"Could not read {path.name} as an image ({cname}: {reason}). "
+            f"It may be corrupt, truncated or not a picture at all.{hint}")
+
+
 def load_rgb(path_str: str) -> np.ndarray:
     """Validate + decode a user file into RGB uint8 (H,W,3)."""
     if not path_str:
@@ -442,25 +507,43 @@ def load_rgb(path_str: str) -> np.ndarray:
     path = Path(str(path_str))
     if not path.exists() or not path.is_file():
         raise InputError(f"File not found: {path}")
-    if path.suffix.lower() not in SUPPORTED_EXT:
-        raise InputError(f"Unsupported file type '{path.suffix or '(none)'}'. "
-                         f"Supported: {', '.join(sorted(SUPPORTED_EXT))}")
+
+    # Fast-path suffix check. Unknown extensions fall through to header sniffing
+    # so renamed files and clipboard pastes still work.
+    has_known_ext = path.suffix.lower() in SUPPORTED_EXT
+
     size = path.stat().st_size
     if size == 0:
         raise InputError(f"{path.name} is empty (0 bytes).")
     if size > MAX_INPUT_BYTES:
         raise InputError(f"{path.name} is {size/1e6:.0f} MB, over the "
                          f"{MAX_INPUT_BYTES//(1<<20)} MB limit. Export a smaller copy.")
+
+    # Guard: if it's explicitly .avif but this Pillow has no decoder, tell them right away.
+    if path.suffix.lower() == ".avif" and not avif_decoder_version():
+        raise InputError(
+            f"Cannot open {path.name}: AVIF decoding is not available in this "
+            "Pillow install. Run `./venv/bin/pip install -U 'pillow>=11.3'` to enable it.")
+
     try:
         with Image.open(path) as im:
-            im.load()
-            im = ImageOps.exif_transpose(im)
-            if im.width * im.height > MAX_INPUT_PIXELS:
+            if not has_known_ext and im.format not in SNIFFABLE_FORMATS:
                 raise InputError(
-                    f"{path.name} is {im.width}x{im.height} "
-                    f"({im.width*im.height/1e6:.0f} MP), over the "
+                    f"Unsupported file type '{path.suffix or '(none)'}' "
+                    f"(detected as {im.format or 'unknown'}). Supported: "
+                    f"{', '.join(sorted(SUPPORTED_EXT))}")
+
+            # Reject absurd dimensions from the header BEFORE decoding pixels.
+            # Large AVIFs can otherwise thrash memory before the check is reached.
+            w, h = im.size
+            if w * h > MAX_INPUT_PIXELS:
+                raise InputError(
+                    f"{path.name} is {w}x{h} ({w*h/1e6:.0f} MP), over the "
                     f"{MAX_INPUT_PIXELS//1_000_000} MP limit this 16 GB Mac can "
                     "handle in one pass. Downscale it and try again.")
+
+            im.load()
+            im = ImageOps.exif_transpose(im)
             if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
                 flat = Image.new("RGB", im.size, (255, 255, 255))
                 rgba = im.convert("RGBA")
@@ -472,9 +555,7 @@ def load_rgb(path_str: str) -> np.ndarray:
     except InputError:
         raise
     except Exception as exc:
-        raise InputError(f"Could not read {path.name} as an image "
-                         f"({exc.__class__.__name__}: {str(exc)[:120]}). "
-                         "It may be corrupt or not a picture.") from None
+        raise InputError(describe_decode_error(path, exc)) from None
 
 
 def checkerboard(h: int, w: int, square: int = 16) -> np.ndarray:
@@ -561,7 +642,10 @@ def build_ui(engine: Engine, default_max_side: str, startup_note: str):
     with gr.Blocks(title="Background Remover") as demo:
         gr.Markdown("## Background Remover (local, offline)\n"
                     "IS-Net ONNX by Trendyol running on this Mac. Nothing is "
-                    "uploaded anywhere. Transparent RGBA PNGs land in `outputs/`.")
+                    "uploaded anywhere. Transparent RGBA PNGs land in `outputs/`.\n\n"
+                    "Accepts JPG, PNG, BMP, TIFF, WebP and AVIF (including AVIF "
+                    "with alpha and 10/12-bit colour); pasted images arrive "
+                    "re-encoded as WebP.")
         gr.Markdown(startup_note)
         with gr.Row():
             with gr.Column(scale=1):
@@ -622,6 +706,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         log("WARNING: onnxruntime 1.16.3 (the last build with Intel-macOS "
             "Monterey support) only has cp311 wheels. Recreate ./venv with "
             "./python311 - see README.md")
+
+    av = avif_decoder_version()
+    if av:
+        log(f"AVIF decoder: {av} (Pillow {PIL.__version__})")
+    else:
+        log(f"WARNING: Pillow {PIL.__version__} has no AVIF decoder - .avif "
+            "uploads will fail. Enable it with: "
+            "./venv/bin/pip install -U 'pillow>=11.3'")
 
     try:
         model_path, utils_path = ensure_model_files()
