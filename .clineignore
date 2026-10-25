@@ -1,0 +1,20 @@
+# Virtualenv + portable interpreter
+venv/
+python311/
+
+# Model weights
+model_cache/
+
+# App output / scratch
+outputs/
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Partial downloads
+*.part
+
+# Cline-specific: things that waste context reads
+.git/
+.clinerules/
+*.log
