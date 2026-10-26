@@ -1,0 +1,6 @@
+gradio>=6.0
+numpy
+opencv-python-headless<5   # 5.x ships no x86_64 py312 wheel; avoids source build
+onnxruntime
+pillow
+requests

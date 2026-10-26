@@ -1,17 +1,46 @@
 # Virtualenv + portable interpreter (recreated by README setup steps)
 venv/
+.venv/
+env/
+ENV/
 python311/
 
 # Model weights + downloaded model code.
 # NEVER commit or redistribute: the Trendyol weights are CC BY-SA 4.0 and must be
 # fetched by each user from https://huggingface.co/Trendyol/background-removal
 model_cache/
+*.onnx
+*.pth
+*.pt
+*.bin
+*.safetensors
 
-# App output / scratch
+# App output / scratch / logs
 outputs/
 __pycache__/
 *.py[cod]
-.DS_Store
-
-# Partial downloads
+*.log
+.gradio/
+tmp/
 *.part
+
+# Environment & local secrets
+.env
+.env.*
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+

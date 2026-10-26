@@ -54,6 +54,19 @@ MAX_INPUT_BYTES = 60 * 1024 * 1024   # reject absurd uploads before decoding
 MAX_INPUT_PIXELS = 60_000_000        # 60 MP; RGBA + mask + resize would thrash 16 GB
 PREVIEW_MAX_SIDE = 1200              # display only - the PNG download stays full res
 
+# --- Real-ESRGAN upscale model (SRVGGNetCompact, 4x) ---
+# The official xinntao / ai-forever releases ship .pth only. This community
+# repo exports the official realesr-general-x4v3 weights to ONNX; size and
+# sha256 below were verified against the live file, and the graph takes
+# "input" [1,3,H,W] float32 RGB 0..1 and returns "output" [1,3,4H,4W].
+UPSCALE_REPO_ID = "vlad-grig/realesr-general-x4v3-onnx"
+UPSCALE_REPO_FILE = "onnx/model.onnx"             # path inside the repo
+UPSCALE_MODEL_FILE = "realesr-general-x4v3.onnx"  # local cache name
+UPSCALE_MODEL_BYTES = 4_866_420
+UPSCALE_MODEL_BYTES_TOL = 200_000
+UPSCALE_MODEL_SHA256 = "7b10e80021ec3e0ff35017ae5022791879d93a799b2e201e1010a37510202266"
+MAX_UPSCALE_INPUT_SIDE = 2048   # 4x output caps at ~8K; keeps VRAM/RAM sane
+
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp",
                  ".avif"}
 # A suffix is only a hint - renamed files exist and clipboard pastes arrive as
@@ -78,11 +91,11 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _download_direct(filename: str, dest: Path) -> None:
+def _download_direct(filename: str, dest: Path, repo_id: str = REPO_ID) -> None:
     """Fallback when huggingface_hub fails: plain streaming GET to a temp file."""
     import requests
 
-    url = f"https://huggingface.co/{REPO_ID}/resolve/main/{filename}"
+    url = f"https://huggingface.co/{repo_id}/resolve/main/{filename}"
     tmp = dest.with_suffix(dest.suffix + ".part")
     log(f"direct download {url}")
     with requests.get(url, stream=True, timeout=1800) as r:
@@ -94,19 +107,19 @@ def _download_direct(filename: str, dest: Path) -> None:
     tmp.replace(dest)
 
 
-def _fetch(filename: str, dest: Path) -> None:
+def _fetch(filename: str, dest: Path, repo_id: str = REPO_ID) -> None:
     """Fetch one repo file into MODEL_DIR. huggingface_hub is imported lazily so
     a warm cache never touches the network or the import."""
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     try:
         from huggingface_hub import hf_hub_download
 
-        hf_hub_download(repo_id=REPO_ID, filename=filename, revision="main",
+        hf_hub_download(repo_id=repo_id, filename=filename, revision="main",
                         local_dir=str(MODEL_DIR))
     except Exception as exc:  # proxy quirks, hub outage, xet problems
         log(f"hf_hub_download failed for {filename} "
             f"({exc.__class__.__name__}: {str(exc)[:120]})")
-        _download_direct(filename, dest)
+        _download_direct(filename, dest, repo_id)
 
 
 def ensure_model_files() -> tuple[Path, Path]:
@@ -152,6 +165,36 @@ def ensure_model_files() -> tuple[Path, Path]:
             "sha256 verified")
 
     return model_path, utils_path
+
+
+def ensure_upscale_model() -> Path:
+    """Return path to realesr-general-x4v3.onnx, downloading if missing."""
+    up_path = MODEL_DIR / UPSCALE_MODEL_FILE
+    size = up_path.stat().st_size if up_path.exists() else -1
+    if abs(size - UPSCALE_MODEL_BYTES) <= UPSCALE_MODEL_BYTES_TOL:
+        log(f"upscale model cached: {size/1e6:.1f} MB")
+        return up_path
+    if up_path.exists():
+        log(f"cached {UPSCALE_MODEL_FILE} looks truncated - re-downloading")
+        up_path.unlink()
+    else:
+        log(f"{UPSCALE_MODEL_FILE} not cached - downloading ~{UPSCALE_MODEL_BYTES/1e6:.0f} MB ...")
+    t0 = time.perf_counter()
+    # ponytail: one streaming GET beats the hf_hub local_dir dance for a 4.9 MB
+    # file in a repo subfolder; the hub path would land it as onnx/model.onnx.
+    _download_direct(UPSCALE_REPO_FILE, up_path, UPSCALE_REPO_ID)
+    size = up_path.stat().st_size if up_path.exists() else -1
+    if abs(size - UPSCALE_MODEL_BYTES) > UPSCALE_MODEL_BYTES_TOL:
+        up_path.unlink(missing_ok=True)
+        raise RuntimeError(f"{UPSCALE_MODEL_FILE} truncated after download ({size:,} bytes)")
+    digest = _sha256(up_path)
+    if digest != UPSCALE_MODEL_SHA256:
+        up_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"{UPSCALE_MODEL_FILE} checksum mismatch - corrupt download or new version. "
+            "Re-run to refetch; if the repo changed, update UPSCALE_MODEL_SHA256.")
+    log(f"{UPSCALE_MODEL_FILE} ok: {size/1e6:.1f} MB in {time.perf_counter()-t0:.1f}s")
+    return up_path
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +480,50 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
+# Processing modes
+# ---------------------------------------------------------------------------
+MODE_BG_ONLY = "Background Removal Only"
+MODE_UPSCALE_AND_BG = "Upscale & Remove Background"
+MODE_UPSCALE_ONLY = "Upscale Only (No Background Removal)"
+PROCESSING_MODES = [MODE_BG_ONLY, MODE_UPSCALE_AND_BG, MODE_UPSCALE_ONLY]
+
+
+# ---------------------------------------------------------------------------
+# Real-ESRGAN upscaler engine
+# ---------------------------------------------------------------------------
+class UpscaleEngine:
+    """Lazy-loaded Real-ESRGAN ONNX session for 4x upscaling."""
+
+    def __init__(self, model_path: Path):
+        self.model_path = Path(model_path)
+        self.session = None
+        self.provider = CPU
+
+    def load(self, provider: str = CPU) -> None:
+        t0 = time.perf_counter()
+        self.session = build_session(self.model_path, provider)
+        self.provider = provider
+        self.input_name = self.session.get_inputs()[0].name
+        self.output_name = self.session.get_outputs()[0].name
+        log(f"upscale session ready on {provider} in {time.perf_counter() - t0:.1f}s")
+
+    def upscale(self, rgb: np.ndarray) -> np.ndarray:
+        """RGB uint8 (H,W,3) -> RGB uint8 (H*4,W*4,3) via Real-ESRGAN."""
+        h, w = rgb.shape[:2]
+        if max(h, w) > MAX_UPSCALE_INPUT_SIDE:
+            raise InputError(
+                f"Image is {w}x{h}. Upscale mode requires both sides <= "
+                f"{MAX_UPSCALE_INPUT_SIDE}px to keep memory sane. "
+                "Resize first or use Background Removal Only.")
+        # ponytail: Real-ESRGAN ONNX expects RGB float32 [0,1] NCHW
+        x = rgb.astype(np.float32) / 255.0
+        x = np.ascontiguousarray(x.transpose(2, 0, 1)[None, ...])
+        out = self.session.run([self.output_name], {self.input_name: x})[0]
+        out = np.clip(out[0].transpose(1, 2, 0) * 255.0, 0, 255).astype(np.uint8)
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Image IO
 # ---------------------------------------------------------------------------
 class InputError(Exception):
@@ -577,47 +664,91 @@ def composite_preview(rgba: np.ndarray, max_side: int = PREVIEW_MAX_SIDE) -> np.
     return (small[..., :3] * a + bg * (1.0 - a)).astype(np.uint8)
 
 
-def process_image(engine: Engine, path_str: str, max_side_choice: str) -> dict:
-    """Full pipeline for one image. Raises InputError on bad input; RuntimeError
-    on an inference failure. Returns timings, paths and the preview array."""
+def _save_output(arr: np.ndarray, mode_str: str, stem: str) -> Path:
+    """Save an RGBA or RGB array to outputs/; return the path."""
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = "upscaled" if mode_str == MODE_UPSCALE_ONLY else "nobg"
+    out_png = OUT_DIR / f"{stem}_{suffix}_{stamp}.png"
+    Image.fromarray(arr, "RGBA" if arr.shape[2] == 4 else "RGB").save(
+        out_png, format="PNG", compress_level=1)
+    return out_png
+
+
+def process_image(engine: Engine, upscale_engine: Optional[UpscaleEngine],
+                  path_str: str, max_side_choice: str,
+                  mode: str = MODE_BG_ONLY) -> dict:
+    """Full pipeline for one image, routed by processing mode. Raises InputError
+    on bad input; RuntimeError on an inference failure. Returns timings, paths
+    and the preview array."""
     t_all = time.perf_counter()
     rgb = load_rgb(path_str)
     max_side = None if str(max_side_choice).lower() == "original" \
         else int(max_side_choice)
-    alpha, stats = engine.mask_for(rgb, max_side)
+    stem = Path(str(path_str)).stem or "image"
 
-    rgba = np.dstack([rgb, alpha])
+    if mode == MODE_UPSCALE_ONLY:
+        if upscale_engine is None:
+            raise RuntimeError("Upscale model is not available")
+        t0 = time.perf_counter()
+        upscaled = upscale_engine.upscale(rgb)
+        t_up = time.perf_counter() - t0
+        out_png = _save_output(upscaled, mode, stem)
+        h, w = upscaled.shape[:2]
+        return {
+            "total": time.perf_counter() - t_all, "prep": 0.0,
+            "infer": t_up, "post": 0.0, "upscale": t_up,
+            "orig": rgb.shape[:2], "work": rgb.shape[:2], "net": (h, w),
+            "provider": upscale_engine.provider, "fixed_input": False,
+            "out_png": str(out_png), "out_mb": out_png.stat().st_size / 1e6,
+            "max_side": max_side_choice, "fg_pct": 100.0, "mode": mode,
+            "preview": upscaled,}
+
+    # Both remaining modes end in an IS-Net cutout; only the input differs.
+    work_rgb, t_up = rgb, 0.0
+    if mode == MODE_UPSCALE_AND_BG:
+        if upscale_engine is None:
+            raise RuntimeError("Upscale model is not available")
+        t0 = time.perf_counter()
+        work_rgb = upscale_engine.upscale(rgb)
+        t_up = time.perf_counter() - t0
+
+    alpha, stats = engine.mask_for(work_rgb, max_side)
+    rgba = np.dstack([work_rgb, alpha])
     if not (rgba.shape[0], rgba.shape[1]) == stats["orig"]:
         raise RuntimeError("internal error: output size does not match the input")
 
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    stem = Path(str(path_str)).stem or "image"
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    out_png = OUT_DIR / f"{stem}_nobg_{stamp}.png"
-    Image.fromarray(rgba, "RGBA").save(out_png, format="PNG", compress_level=1)
-
+    out_png = _save_output(rgba, mode, stem)
     stats["total"] = time.perf_counter() - t_all
     stats["out_png"] = str(out_png)
     stats["out_mb"] = out_png.stat().st_size / 1e6
     stats["max_side"] = max_side_choice
     stats["fg_pct"] = float((alpha > 127).mean() * 100.0)
+    stats["mode"] = mode
+    stats["upscale"] = t_up
     stats["preview"] = composite_preview(rgba)
     return stats
 
 
 def stats_markdown(s: dict) -> str:
     h, w = s["orig"]
+    mode = s.get("mode", MODE_BG_ONLY)
+    fmt = "RGB PNG (no transparency)" if mode == MODE_UPSCALE_ONLY else "RGBA PNG"
     fixed = ("The ONNX graph is fixed at {0}x{1}, so Max side only changes the "
              "CPU pre/post work, not inference time."
              ).format(s["net"][0], s["net"][1]) if s["fixed_input"] else \
             "Max side feeds the network directly."
+    up = f"upscale **{s['upscale']:.2f}s**, " if s.get("upscale", 0) > 0 else ""
+    fg = (f", foreground {s['fg_pct']:.1f}% of pixels" if mode != MODE_UPSCALE_ONLY
+          else "")
     return (
-        f"**Done in {s['total']:.2f}s**  |  model **{s['infer']:.2f}s**, "
+        f"**Done in {s['total']:.2f}s** ({mode})  |  {up}"
+        f"model **{s['infer']:.2f}s**, "
         f"pre {s['prep']:.2f}s, post {s['post']:.2f}s  |  "
         f"provider **{s['provider']}**<br>"
-        f"Output **{w}x{h}** RGBA PNG, {s['out_mb']:.1f} MB -> `{s['out_png']}`<br>"
+        f"Output **{w}x{h}** {fmt}, {s['out_mb']:.1f} MB -> `{s['out_png']}`<br>"
         f"Working size {s['work'][1]}x{s['work'][0]}, network "
-        f"{s['net'][1]}x{s['net'][0]}, foreground {s['fg_pct']:.1f}% of pixels. "
+        f"{s['net'][1]}x{s['net'][0]}{fg}. "
         f"{fixed}"
     )
 
@@ -625,24 +756,39 @@ def stats_markdown(s: dict) -> str:
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
-def build_ui(engine: Engine, default_max_side: str, startup_note: str):
+def build_ui(engine: Engine, upscale_model_path: Optional[Path],
+             default_max_side: str, startup_note: str):
     import gradio as gr
 
-    def run(image_path, max_side_choice):
+    # ponytail: lazy-load the upscale session on first upscale request (~65 MB
+    # of RAM is not worth paying when only background removal is used)
+    _uc: list[Optional[UpscaleEngine]] = [None]
+
+    def get_upscale() -> Optional[UpscaleEngine]:
+        if upscale_model_path is None:
+            return None
+        if _uc[0] is None:
+            _uc[0] = UpscaleEngine(upscale_model_path)
+            _uc[0].load(engine.provider)
+        return _uc[0]
+
+    def run(image_path, mode, max_side_choice):
         try:
-            s = process_image(engine, image_path, max_side_choice)
+            ue = None if mode == MODE_BG_ONLY else get_upscale()
+            s = process_image(engine, ue, image_path, max_side_choice, mode)
         except InputError as exc:
             return None, None, f"**{exc}**"
         except Exception as exc:
             return None, None, (
                 f"**Processing failed** ({exc.__class__.__name__}): {str(exc)[:300]}\n\n"
                 "The image was not saved. See the console for details.")
+        # DownloadButton takes the file path straight from the second output
         return s["preview"], s["out_png"], stats_markdown(s)
 
     with gr.Blocks(title="Background Remover") as demo:
-        gr.Markdown("## Background Remover (local, offline)\n"
-                    "IS-Net ONNX by Trendyol running on this Mac. Nothing is "
-                    "uploaded anywhere. Transparent RGBA PNGs land in `outputs/`.\n\n"
+        gr.Markdown("## Background Remover & Upscaler (local, offline)\n"
+                    "IS-Net ONNX by Trendyol + Real-ESRGAN running on this Mac. "
+                    "Nothing is uploaded anywhere. Results land in `outputs/`.\n\n"
                     "Accepts JPG, PNG, BMP, TIFF, WebP and AVIF (including AVIF "
                     "with alpha and 10/12-bit colour); pasted images arrive "
                     "re-encoded as WebP.")
@@ -651,15 +797,18 @@ def build_ui(engine: Engine, default_max_side: str, startup_note: str):
             with gr.Column(scale=1):
                 img_in = gr.Image(type="filepath", label="Photo",
                                   sources=["upload", "clipboard"])
+                mode_radio = gr.Radio(choices=PROCESSING_MODES,
+                                      value=MODE_BG_ONLY, label="Processing Mode")
                 side_dd = gr.Dropdown(choices=MAX_SIDE_CHOICES, value=default_max_side,
                                       label="Max side length (processed size)")
-                btn = gr.Button("Remove background", variant="primary")
+                btn = gr.Button("Process", variant="primary")
             with gr.Column(scale=1):
                 preview = gr.Image(type="numpy", label="Result (checkerboard = "
                                                        "transparent)", interactive=False)
-                dl = gr.DownloadButton("Download transparent PNG", size="lg")
-        status = gr.Markdown("Pick a photo and press **Remove background**.")
-        btn.click(run, inputs=[img_in, side_dd],
+                dl = gr.DownloadButton("Download result", size="lg")
+        status = gr.Markdown("Pick a photo, choose a processing mode, and press "
+                             "**Process**.")
+        btn.click(run, inputs=[img_in, mode_radio, side_dd],
                   outputs=[preview, dl, status], show_progress="full")
     return demo
 
@@ -667,11 +816,13 @@ def build_ui(engine: Engine, default_max_side: str, startup_note: str):
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def bench(engine: Engine, image_path: str, max_side_choice: str) -> int:
-    log(f"bench: {image_path} (max side: {max_side_choice})")
+def bench(engine: Engine, upscale_engine: Optional[UpscaleEngine],
+          image_path: str, max_side_choice: str, mode: str = MODE_BG_ONLY) -> int:
+    log(f"bench: {image_path} (mode={mode}, max side: {max_side_choice})")
     for run_no in (1, 2):
         try:
-            s = process_image(engine, image_path, max_side_choice)
+            s = process_image(engine, upscale_engine, image_path,
+                              max_side_choice, mode)
         except InputError as exc:
             log(f"bench run {run_no}: {exc}")
             return 1
@@ -692,6 +843,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--bench", metavar="IMAGE",
                     help="process IMAGE twice and print timings instead of starting "
                          "the UI")
+    ap.add_argument("--mode", choices=PROCESSING_MODES, default=MODE_BG_ONLY,
+                    help=f"processing mode for --bench (default: {MODE_BG_ONLY})")
     ap.add_argument("--max-side", choices=MAX_SIDE_CHOICES, default=DEFAULT_MAX_SIDE,
                     help=f"default processed size (default: {DEFAULT_MAX_SIDE})")
     ap.add_argument("--host", default="127.0.0.1")
@@ -724,6 +877,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
     load_repo_utils(utils_path)
 
+    # Upscale model: download/check now, load into memory lazily in the UI
+    upscale_model_path: Optional[Path] = None
+    try:
+        upscale_model_path = ensure_upscale_model()
+    except Exception as exc:
+        log(f"WARNING: upscale model unavailable ({exc}) - "
+            "upscale modes will be disabled")
+
     engine = Engine(model_path)
     try:
         engine.setup_provider(args.try_coreml)
@@ -732,12 +893,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 1
 
     if args.bench:
-        return bench(engine, args.bench, args.max_side)
+        ue = None
+        if args.mode != MODE_BG_ONLY and upscale_model_path:
+            ue = UpscaleEngine(upscale_model_path)
+            ue.load(engine.provider)
+        return bench(engine, ue, args.bench, args.max_side, args.mode)
 
-    note = (f"*Model cached in `model_cache/` ({MODEL_BYTES/1e6:.0f} MB), "
-            f"inference on **{engine.provider}**, network input "
+    up_note = (f", upscale model {UPSCALE_MODEL_BYTES/1e6:.0f} MB"
+               if upscale_model_path else ", upscale model **unavailable**")
+    note = (f"*Models cached in `model_cache/` (IS-Net {MODEL_BYTES/1e6:.0f} MB"
+            f"{up_note}), inference on **{engine.provider}**, network input "
             f"{engine.net_hw[1]}x{engine.net_hw[0]}.*")
-    demo = build_ui(engine, args.max_side, note)
+    demo = build_ui(engine, upscale_model_path, args.max_side, note)
     log(f"UI on http://{args.host}:{args.port} (Ctrl-C to stop)")
     demo.launch(server_name=args.host, server_port=args.port,
                 inbrowser=not args.no_browser, share=False)
